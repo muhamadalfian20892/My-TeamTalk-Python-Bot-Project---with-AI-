@@ -10,8 +10,8 @@ import wx
 import threading # Added for GUI threading
 import configparser # Added for configuration
 import random # For the random delay, welcome messages
+import re
 
-# --- Requests Integration (for Weather) ---
 try:
     import requests
     REQUESTS_AVAILABLE = True
@@ -20,9 +20,7 @@ except ImportError:
     print("Please install it using: pip install requests")
     print("Weather features will be disabled.")
     REQUESTS_AVAILABLE = False
-# ---------------------------------------
 
-# --- Gemini Integration ---
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -31,10 +29,7 @@ except ImportError:
     print("Please install it using: pip install google-generativeai")
     print("Gemini features will be disabled.")
     GEMINI_AVAILABLE = False
-# ------------------------
 
-# --- TeamTalk Wrapper ---
-# Use the imported TeamTalk5.py content
 try:
     from TeamTalk5 import (
         TeamTalk, TeamTalkError, ClientEvent, TextMsgType, User, Channel,
@@ -44,11 +39,16 @@ try:
         ttstr, buildTextMessage, TT_LOCAL_USERID,
         ClientError, ClientFlags, TT_STRLEN # Import TT_STRLEN
     )
+    GEMINI_SAFETY_SETTINGS = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    ]
 except ImportError:
     print("FATAL ERROR: Could not import TeamTalk5 wrapper.")
     print("Ensure TeamTalk5.py is in the same directory or Python path.")
     sys.exit(1)
-# --- End TeamTalk Wrapper ---
 
 
 # --- Constants ---
@@ -64,14 +64,14 @@ DEFAULT_CONFIG = {
         'channel_password': ''
     },
     'Bot': {
-        'client_name': 'New TeamTalk Bot v2.4', # Version bump!
+        'client_name': 'New TeamTalk Bot v2.6', # Version bump!
         'admin_usernames': '',
         'gemini_api_key': '',
         'status_message': '', # Added default for status message
         'reconnect_delay_min': '5', # Seconds
-        'reconnect_delay_max': '15', # Seconds # Corrected: Added comma
-        'weather_api_key': '', # For OpenWeatherMap or similar # Corrected: Added comma
-        'filtered_words': ''   # Comma-separated list # Corrected: Added comma
+        'reconnect_delay_max': '15', # Seconds
+        'weather_api_key': '', # For OpenWeatherMap or similar
+        'filtered_words': ''   # Comma-separated list
     }
 }
 
@@ -126,9 +126,10 @@ def save_config(structured_config_data):
         'gemini_api_key': bot_data.get('gemini_api_key', ''), # Save API key
         'status_message': bot_data.get('status_message', ''), # Save status message
         'reconnect_delay_min': str(bot_data.get('reconnect_delay_min', DEFAULT_CONFIG['Bot']['reconnect_delay_min'])),
-        'reconnect_delay_max': str(bot_data.get('reconnect_delay_max', DEFAULT_CONFIG['Bot']['reconnect_delay_max'])), # Corrected: Added comma
-        'weather_api_key': bot_data.get('weather_api_key', ''), # Corrected: Added comma
-        'filtered_words': bot_data.get('filtered_words', '') # Corrected: Added comma
+        'reconnect_delay_max': str(bot_data.get('reconnect_delay_max', DEFAULT_CONFIG['Bot']['reconnect_delay_max'])),
+        'weather_api_key': bot_data.get('weather_api_key', ''),
+        'filtered_words': bot_data.get('filtered_words', '')
+        # Note: welcome_message_mode is not saved to config by default
     }
 
     try:
@@ -143,7 +144,7 @@ def save_config(structured_config_data):
 # --- Initial Setup Dialog ---
 class ConfigDialog(wx.Dialog):
     def __init__(self, parent, title, defaults):
-        super(ConfigDialog, self).__init__(parent, title=title, size=(550, 430)) # Slightly taller for delay
+        super(ConfigDialog, self).__init__(parent, title=title, size=(550, 460)) # Slightly taller for weather key
 
         self.config_data = defaults.copy() # Store defaults to return if needed
 
@@ -208,6 +209,14 @@ class ConfigDialog(wx.Dialog):
         grid.Add(self.tcApiKey, pos=(row, 1), span=(1, 3), flag=wx.EXPAND | wx.RIGHT, border=10)
         row += 1
 
+        # Weather API Key
+        lbl_weather_api = wx.StaticText(panel, label="Weather API Key (OpenWeatherMap):")
+        grid.Add(lbl_weather_api, pos=(row, 0), flag=wx.LEFT | wx.ALIGN_CENTER_VERTICAL, border=10)
+        self.tcWeatherApiKey = wx.TextCtrl(panel, style=wx.TE_PASSWORD, value=defaults.get('weather_api_key', ''))
+        grid.Add(self.tcWeatherApiKey, pos=(row, 1), span=(1, 3), flag=wx.EXPAND | wx.RIGHT, border=10)
+        row += 1
+
+
         # Reconnect Delay
         lbl_delay = wx.StaticText(panel, label="Reconnect Delay (min/max sec):")
         grid.Add(lbl_delay, pos=(row, 0), flag=wx.LEFT | wx.ALIGN_CENTER_VERTICAL, border=10)
@@ -267,6 +276,7 @@ class ConfigDialog(wx.Dialog):
         status_msg = self.tcStatus.GetValue() # Allow empty, don't strip leading/trailing spaces? User choice.
         admins = self.tcAdmin.GetValue().strip()
         key = self.tcApiKey.GetValue().strip() # API key can be empty
+        weather_key = self.tcWeatherApiKey.GetValue().strip() # Weather API key can be empty
         delay_min_str = self.tcDelayMin.GetValue().strip()
         delay_max_str = self.tcDelayMax.GetValue().strip()
 
@@ -301,9 +311,7 @@ class ConfigDialog(wx.Dialog):
             self.tcDelayMin.SetFocus()
             return
 
-        # Admins can be empty, key can be empty, status can be empty
 
-        # Store validated data into the dictionary we will return
         self.config_data['host'] = host
         self.config_data['port'] = port # Store as int here
         self.config_data['username'] = user
@@ -312,9 +320,10 @@ class ConfigDialog(wx.Dialog):
         self.config_data['status_message'] = status_msg # Store status
         self.config_data['admin_usernames'] = admins
         self.config_data['gemini_api_key'] = key
+        self.config_data['weather_api_key'] = weather_key # Store weather key
         self.config_data['reconnect_delay_min'] = delay_min
         self.config_data['reconnect_delay_max'] = delay_max
-        # Keep channel/channel_password/client_name from defaults if not edited
+        # Keep channel/channel_password/client_name/filtered_words from defaults if not edited
 
         self.EndModal(wx.ID_OK) # Signal success
 
@@ -345,13 +354,12 @@ class ConfigDialog(wx.Dialog):
                   'status_message': self.config_data.get('status_message'), # Include status
                   'reconnect_delay_min': self.config_data.get('reconnect_delay_min', DEFAULT_CONFIG['Bot']['reconnect_delay_min']),
                   'reconnect_delay_max': self.config_data.get('reconnect_delay_max', DEFAULT_CONFIG['Bot']['reconnect_delay_max']),
-                  'weather_api_key': self.config_data.get('weather_api_key', DEFAULT_CONFIG['Bot']['weather_api_key']), # Added missing keys
-                  'filtered_words': self.config_data.get('filtered_words', DEFAULT_CONFIG['Bot']['filtered_words'])   # Added missing keys
+                  'weather_api_key': self.config_data.get('weather_api_key', DEFAULT_CONFIG['Bot']['weather_api_key']), # Use get()
+                  'filtered_words': self.config_data.get('filtered_words', DEFAULT_CONFIG['Bot']['filtered_words'])   # Use get()
              }
         }
         return structured_data
 
-# --- Main Bot Window ---
 class MainBotWindow(wx.Frame):
     def __init__(self, parent, title, bot_instance_ref):
         super(MainBotWindow, self).__init__(parent, title=title, size=(850, 550)) # Wider window
@@ -463,7 +471,9 @@ class MainBotWindow(wx.Frame):
             "welcome": "Join/Leave Announce",
             "gemini_pm": "Gemini AI (PM)",
             "gemini_chan": "Gemini AI (Channel /c)",
+            "filter": "Word Filter", # Added Filter Status
             "locked": "Bot Locked (Reduced Func)"
+            # Note: Welcome Message Mode is not shown in this list (command only toggle)
         }
 
         # Get current state from bot
@@ -473,10 +483,10 @@ class MainBotWindow(wx.Frame):
             "welcome": getattr(current_bot, 'announce_join_leave', False),
             "gemini_pm": getattr(current_bot, 'allow_gemini_pm', False),
             "gemini_chan": getattr(current_bot, 'allow_gemini_channel', False),
+            "filter": getattr(current_bot, 'filter_enabled', False), # Get Filter State
             "locked": getattr(current_bot, 'bot_locked', False)
         }
 
-        # Update the list (clear and repopulate for simplicity)
         self.feature_list.DeleteAllItems()
         self.feature_map.clear() # Reset map
 
@@ -502,29 +512,33 @@ class MainBotWindow(wx.Frame):
 
         # Call a toggle method on the bot instance
         # These methods exist in the bot class now
-        toggle_method = getattr(current_bot, f"toggle_{feature_key}", None) # Simplified way to get toggle methods
+        toggle_method_name = f"toggle_{feature_key}"
         if feature_key == "locked": # Specific name for lock toggle
-            toggle_method = getattr(current_bot, "toggle_bot_lock", None)
+            toggle_method_name = "toggle_bot_lock"
+        elif feature_key == "filter": # Specific name for filter toggle
+             toggle_method_name = "toggle_filter"
+        elif feature_key == "welcome": # GUI toggle for welcome (maps to jcl)
+             toggle_method_name = "toggle_announce_join_leave"
         elif feature_key == "ch_msg":
-             toggle_method = getattr(current_bot, "toggle_allow_channel_messages", None)
+             toggle_method_name = "toggle_allow_channel_messages"
         elif feature_key == "broadcast":
-             toggle_method = getattr(current_bot, "toggle_allow_broadcast", None)
-        elif feature_key == "welcome":
-             toggle_method = getattr(current_bot, "toggle_announce_join_leave", None)
+             toggle_method_name = "toggle_allow_broadcast"
         elif feature_key == "gemini_pm":
-             toggle_method = getattr(current_bot, "toggle_allow_gemini_pm", None)
+             toggle_method_name = "toggle_allow_gemini_pm"
         elif feature_key == "gemini_chan":
-             toggle_method = getattr(current_bot, "toggle_allow_gemini_channel", None)
+             toggle_method_name = "toggle_allow_gemini_channel"
 
+
+        toggle_method = getattr(current_bot, toggle_method_name, None)
 
         if toggle_method and callable(toggle_method):
             toggle_method()
+            # This ensures the list reflects the new state confirmed by the bot logic
+            self.update_feature_list()
         else:
-             self.log_message(f"[GUI Error] Unknown or non-callable feature toggle for key '{feature_key}'.")
+             self.log_message(f"[GUI Error] Unknown or non-callable feature toggle method '{toggle_method_name}' for key '{feature_key}'.")
              return
 
-        # Update the list display immediately
-        self.update_feature_list()
 
     def OnSendChannelMessage(self, event):
         """Sends the text from the channel message input box."""
@@ -608,7 +622,7 @@ class MyTeamTalkBot(TeamTalk):
     """
     TeamTalk bot with config, GUI logging, admin commands, and Gemini integration.
     Includes saving nickname/status, restart command, auto-reconnect, PM Gemini, Welcome Msg, etc.
-    ** NEW: Feature toggles, GUI interaction, command blocking, weather, polls, filter **
+    ** NEW: Feature toggles, GUI interaction, command blocking, weather, polls, filter (Regex + Toggle), Gemini Welcome **
     """
     def __init__(self, config_dict): # Takes structured config dictionary
         super().__init__()
@@ -629,8 +643,11 @@ class MyTeamTalkBot(TeamTalk):
 
         # --- Load New Feature Config ---
         self.weather_api_key = bot_conf.get('weather_api_key', '')
+        # Filter setup
         filter_str = bot_conf.get('filtered_words', '')
         self.filtered_words = {word.strip().lower() for word in filter_str.split(',') if word.strip()}
+        self.filter_enabled = bool(self.filtered_words) # Enable filter only if words are defined
+
         self._weather_enabled = REQUESTS_AVAILABLE and bool(self.weather_api_key)
         if REQUESTS_AVAILABLE and not self.weather_api_key:
             logging.warning("Weather API key missing in config. Weather feature disabled.")
@@ -673,11 +690,12 @@ class MyTeamTalkBot(TeamTalk):
         self.allow_gemini_pm = True # Initial state, updated on Gemini init/toggle
         self.allow_gemini_channel = True # Initial state, updated on Gemini init/toggle
         self.bot_locked = False
+        self.welcome_message_mode = "template" # Options: "template", "gemini"
+        # self.filter_enabled is set above based on config
 
-        # ** NEW: Command blocking **
         self.blocked_commands = set()
         # Define commands that *cannot* be blocked
-        self.UNBLOCKABLE_COMMANDS = {'h', 'q', 'rs', 'block', 'unblock', 'info', 'whoami', 'rights'} # 'unblock' is checked via 'block' cmd
+        self.UNBLOCKABLE_COMMANDS = {'h', 'q', 'rs', 'block', 'unblock', 'info', 'whoami', 'rights', 'lock', '!tfilter', '!tgmmode'}
 
         # --- Gemini Initialization ---
         self._gemini_enabled = False # Set to False initially
@@ -696,9 +714,11 @@ class MyTeamTalkBot(TeamTalk):
             logging.info("Weather feature is enabled.")
 
         if not self.filtered_words:
-            logging.info("Word filter is inactive (no words defined in config).")
+            logging.info("Word filter is inactive (no words defined in config). Filter globally disabled.")
+        elif not self.filter_enabled:
+            logging.info(f"Word filter has {len(self.filtered_words)} words, but is disabled.")
         else:
-            logging.info(f"Word filter active with {len(self.filtered_words)} words.")
+            logging.info(f"Word filter active and enabled with {len(self.filtered_words)} words.")
 
 
     def _init_gemini(self, api_key):
@@ -780,7 +800,6 @@ class MyTeamTalkBot(TeamTalk):
 
     def _send_channel_message(self, channel_id: int, message: str):
         if not message or channel_id <= 0: return False
-        # Basic check: Bot should be logged in to send channel messages
         if not self._logged_in or self._my_user_id <= 0:
              logging.warning(f"Attempted to send channel msg to {channel_id} while not logged in.")
              return False
@@ -819,7 +838,6 @@ class MyTeamTalkBot(TeamTalk):
 
     def _send_broadcast(self, message: str):
         if not message: return False
-        # Basic check: Bot should be logged in to send broadcasts
         if not self._logged_in or self._my_user_id <= 0:
              logging.warning(f"Attempted to send broadcast while not logged in.")
              return False
@@ -864,10 +882,10 @@ class MyTeamTalkBot(TeamTalk):
         hours, rem = divmod(rem, 3600)
         mins, secs = divmod(rem, 60)
         parts = []
-        if days >= 1: parts.append(f"{int(days)}d")
-        if hours >= 1: parts.append(f"{int(hours)}h")
-        if mins >= 1: parts.append(f"{int(mins)}m")
-        parts.append(f"{int(secs)}s")
+        if days >= 1: parts.append(f"{int(days)}days")
+        if hours >= 1: parts.append(f"{int(hours)}hours")
+        if mins >= 1: parts.append(f"{int(mins)}minutes")
+        parts.append(f"{int(secs)}seconds")
         return " ".join(parts) if parts else "0s"
 
     def _find_user_by_nick(self, nickname: str) -> User | None:
@@ -923,7 +941,6 @@ class MyTeamTalkBot(TeamTalk):
         """Flags that the stop was initiated by user/admin action."""
         self._intentional_stop = True
 
-    # --- Poll Feature Helpers ---
     def _handle_poll_command(self, args_str, user_id):
         # Quick parsing: split by ", look for >= 3 parts (cmd, question, opt1, opt2...)
         try:
@@ -1114,10 +1131,11 @@ class MyTeamTalkBot(TeamTalk):
                 self._send_pm(user_id, f"Word '{word}' is already in the filter list.")
             else:
                 self.filtered_words.add(word)
+                self.filter_enabled = True # Ensure filter is enabled when adding a word
                 self._save_runtime_config() # Save changes
-                self._send_pm(user_id, f"Word '{word}' added to the filter list.")
-                self._log_to_gui(f"[Filter] Admin added '{word}' to filter list.")
-                logging.info(f"Admin (ID: {user_id}) added '{word}' to filter list.")
+                self._send_pm(user_id, f"Word '{word}' added to the filter list. Filter automatically enabled.")
+                self._log_to_gui(f"[Filter] Admin added '{word}' to filter list. Filter enabled.")
+                logging.info(f"Admin (ID: {user_id}) added '{word}' to filter list. Filter enabled.")
 
         elif sub_command == "remove":
             if not word:
@@ -1125,6 +1143,10 @@ class MyTeamTalkBot(TeamTalk):
                 return
             if word in self.filtered_words:
                 self.filtered_words.discard(word) # Use discard, no error if not found
+                if not self.filtered_words: # If list becomes empty, disable filter
+                    self.filter_enabled = False
+                    logging.info("Filter list became empty, disabling filter globally.")
+                    self._log_to_gui("[Filter] Filter list empty, filter disabled.")
                 self._save_runtime_config() # Save changes
                 self._send_pm(user_id, f"Word '{word}' removed from the filter list.")
                 self._log_to_gui(f"[Filter] Admin removed '{word}' from filter list.")
@@ -1137,7 +1159,8 @@ class MyTeamTalkBot(TeamTalk):
                 self._send_pm(user_id, "The filter list is currently empty.")
             else:
                 filter_list_str = ", ".join(sorted(list(self.filtered_words)))
-                self._send_pm(user_id, f"Filtered Words: {filter_list_str}")
+                status = "ENABLED" if self.filter_enabled else "DISABLED"
+                self._send_pm(user_id, f"Filtered Words ({status}): {filter_list_str}")
         else:
             self._send_pm(user_id, "Usage: !filter <add|remove|list> [word]")
 
@@ -1221,11 +1244,10 @@ class MyTeamTalkBot(TeamTalk):
                  if self._tt is not None and hasattr(self, 'closeTeamTalk') and callable(self.closeTeamTalk):
                     log_msg = "Closing TeamTalk SDK instance..."
                     logging.info(log_msg)
-                    self._log_to_gui(log_msg)
+                    # Don't log to GUI here as it might already be closed
                     self.closeTeamTalk() # This will invalidate self._tt
                     log_msg = "TeamTalk SDK closed."
                     logging.info(log_msg)
-                    self._log_to_gui(log_msg)
                  elif self._tt is None:
                     logging.debug("TeamTalk instance was already None before final close.")
                  else:
@@ -1251,11 +1273,9 @@ class MyTeamTalkBot(TeamTalk):
         try:
             # Check if the underlying _tt instance is valid *after* super().__init__()
             # TeamTalk5 wrapper might initialize _tt=None until connect is called
+            # If connect itself fails below, it will be handled.
             if self._tt is None:
-                # It's normal for _tt to be None before connect in some wrapper versions.
-                # Let's attempt connect anyway.
                 logging.debug("TeamTalk instance (_tt) is None before connect, proceeding...")
-                # If connect itself fails below, it will be handled.
 
             connected = self.connect(self.host, self.tcp_port, self.udp_port, 0, 0, bEncrypted=False)
             if not connected:
@@ -1329,7 +1349,7 @@ class MyTeamTalkBot(TeamTalk):
             # This finally block runs after the loop exits or if an exception occurred during start
             log_msg = "Start method finishing, ensuring cleanup via stop()..."
             logging.info(log_msg)
-            self._log_to_gui(log_msg)
+            # Don't log to GUI in finally, it might be gone
             self.stop() # Call stop to ensure resources are released
 
 
@@ -1440,7 +1460,7 @@ class MyTeamTalkBot(TeamTalk):
             ClientError.CMDERR_INVALID_ACCOUNT,
             ClientError.CMDERR_ALREADY_LOGGEDIN,
             ClientError.CMDERR_SERVER_BANNED,
-            ClientError.CMDERR_INVALID_CLIENT_VERSION,
+            # ClientError.CMDERR_INVALID_CLIENT_VERSION, # Assuming this exists
             # Add other potentially fatal errors here
         ]
 
@@ -1449,7 +1469,7 @@ class MyTeamTalkBot(TeamTalk):
                 ClientError.CMDERR_INVALID_ACCOUNT: "Invalid username or password.",
                 ClientError.CMDERR_ALREADY_LOGGEDIN: "Account may already be logged in elsewhere.",
                 ClientError.CMDERR_SERVER_BANNED: "This IP or account is banned from the server.",
-                ClientError.CMDERR_INVALID_CLIENT_VERSION: "Client version is incompatible with the server."
+                # ClientError.CMDERR_INVALID_CLIENT_VERSION: "Client version is incompatible with the server."
             }.get(errmsg.nErrorNo, f"Critical Error {errmsg.nErrorNo}")
 
             self._log_to_gui(f"Login/Connection failed: {error_reason}")
@@ -1464,7 +1484,7 @@ class MyTeamTalkBot(TeamTalk):
                  ClientError.CMDERR_CHANNEL_NOT_FOUND: f"Channel '{ttstr(self.target_channel_path)}' not found.",
                  ClientError.CMDERR_INCORRECT_CHANNEL_PASSWORD: f"Incorrect password for '{ttstr(self.target_channel_path)}'.",
                  ClientError.CMDERR_CHANNEL_BANNED: f"Banned from '{ttstr(self.target_channel_path)}'.",
-                 ClientError.CMDERR_CHANNEL_CAPACITY_FULL: f"Channel '{ttstr(self.target_channel_path)}' is full.",
+                 ClientError.CMDERR_MAX_CHANNEL_USERS_EXCEEDED: f"Channel '{ttstr(self.target_channel_path)}' is full.",
              }.get(errmsg.nErrorNo, error_msg_str) # Default to the SDK message
 
              self._log_to_gui(f"Failed to join channel: {join_error_reason}")
@@ -1488,6 +1508,7 @@ class MyTeamTalkBot(TeamTalk):
         self.allow_broadcast = bool(self.my_rights & UserRight.USERRIGHT_TEXTMESSAGE_BROADCAST)
         self.allow_gemini_pm = self._gemini_enabled # Gemini PM allowed if init was successful
         self.allow_gemini_channel = self._gemini_enabled # Gemini Channel allowed if init was successful
+
 
 
         # --- Show Main Window & Update Features ---
@@ -1665,16 +1686,52 @@ class MyTeamTalkBot(TeamTalk):
                  logging.info(f"  Recognized joining user '{user_nick}' as admin.")
                  self._log_to_gui(f"Recognized joining user '{user_nick}' as admin.")
 
-            # Welcome Message Feature (Check toggle and if it's the bot's channel)
+            # --- Welcome Message Feature (Check toggle and if it's the bot's channel) ---
             if self._in_channel and channel_id == self._target_channel_id and self.announce_join_leave:
-                welcome_messages = [
-                    "Hey {nick}, welcome!", "Welcome aboard, {nick}!", "Good to see you, {nick}!",
-                    "Hi {nick}, pull up a chair!", "Greetings, {nick}!", "Howdy, {nick}!",
-                ]
-                welcome_message = random.choice(welcome_messages).format(nick=user_nick)
-                logging.info(f"Sending welcome message to {user_nick} in {channel_path}.")
-                # Use _send method which checks allow_channel_messages flag internally
+                welcome_message = ""
+
+                # Check the mode
+                if self.welcome_message_mode == "gemini":
+                    if self._gemini_enabled and self.gemini_model:
+                        logging.info(f"Attempting Gemini welcome for {user_nick}...")
+                        prompt = "give me 1 welcome message to say welcome for people in a channel, just go with the welcome message. dont say this is bla bla bla or anything. you can say anything to welcome the user, dont just hello everyone. the style is casual. and remember, you're saying is completely random, just go with that thing overtime"
+                        try:
+                            response = self.gemini_model.generate_content(prompt, stream=False, safety_settings=GEMINI_SAFETY_SETTINGS)
+                            # Safely extract text
+                            if hasattr(response, 'text'):
+                                welcome_message = response.text
+                            elif hasattr(response, 'parts') and response.parts:
+                                welcome_message = "".join(part.text for part in response.parts if hasattr(part, 'text'))
+                            elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+                                logging.warning(f"Gemini welcome message blocked: {response.prompt_feedback.block_reason.name}")
+                                welcome_message = "" # Fallback below
+                            else:
+                                logging.warning("Gemini welcome returned empty/unexpected response.")
+                                welcome_message = "" # Fallback below
+
+                            if not welcome_message.strip():
+                                logging.warning("Gemini welcome resulted in empty text.")
+                                welcome_message = "" # Fallback below
+
+                        except Exception as e:
+                            logging.error(f"Error calling Gemini for welcome message: {e}")
+                            welcome_message = "" # Fallback below
+                    else:
+                        logging.warning("Welcome mode is Gemini, but Gemini is not enabled/ready. Falling back to template.")
+                        welcome_message = "" # Fallback below
+
+                # Fallback to template if mode is template, or if Gemini failed/returned empty
+                if not welcome_message:
+                    template_messages = [
+                        "Hey {nick}, welcome!", "Welcome aboard, {nick}!", "Good to see you, {nick}!",
+                        "Hi {nick}, pull up a chair!", "Greetings, {nick}!", "Howdy, {nick}!",
+                    ]
+                    welcome_message = random.choice(template_messages).format(nick=user_nick)
+
+                # Send the final message (template or Gemini)
+                logging.info(f"Sending welcome message ({self.welcome_message_mode} mode) to {user_nick} in {channel_path}.")
                 self._send_channel_message(channel_id, welcome_message)
+            # --- End Welcome Message ---
 
 
     def onCmdUserLeftChannel(self, channelid: int, user: User):
@@ -1790,16 +1847,14 @@ class MyTeamTalkBot(TeamTalk):
             # Ignore commands in broadcast for simplicity
             return
 
-        # --- Word Filter Logic (Only applies to channel messages intended for processing) ---
-        if process_commands and msg_type == TextMsgType.MSGTYPE_CHANNEL and self.filtered_words:
-            msg_lower = full_message_text.lower()
+        # Check if filter is enabled *and* words exist *and* message needs processing
+        if self.filter_enabled and process_commands and msg_type == TextMsgType.MSGTYPE_CHANNEL and self.filtered_words:
+            msg_lower = full_message_text.lower() # Case-insensitive message check
             found_bad_word = None
             for word in self.filtered_words:
-                # Simple check: is the filtered word *in* the message?
-                # Refine with word boundaries (\bword\b) for more precision if needed:
-                # import re
-                # if re.search(r'\b' + re.escape(word) + r'\b', msg_lower):
-                if word in msg_lower:
+                # Use word boundaries to avoid filtering parts of words
+                pattern = r'\b' + re.escape(word) + r'\b'
+                if re.search(pattern, msg_lower, re.IGNORECASE):
                     found_bad_word = word
                     break # Found one, stop checking
 
@@ -1814,7 +1869,6 @@ class MyTeamTalkBot(TeamTalk):
                 warning_msg = f"Warning {current_warnings}/3 for {sender_nick}: Please avoid inappropriate language ('{found_bad_word}')."
                 self._send_channel_message(msg_channel_id, warning_msg) # Warn in the channel
 
-                # Action on reaching threshold (e.g., 3 warnings)
                 if current_warnings >= 3:
                     self._log_to_gui(f"[Filter] Kicking user '{sender_nick}' after 3 warnings.")
                     logging.warning(f"Kicking user '{sender_nick}' (ID: {msg_from_id}) from channel {msg_channel_id} after 3 language warnings.")
@@ -1885,7 +1939,7 @@ class MyTeamTalkBot(TeamTalk):
 
         # --- Bot Locked Check ---
         # Define commands allowed even when locked (mostly admin essentials + help/info)
-        LOCKED_ALLOWED_COMMANDS = {'h', 'q', 'rs', 'block', 'unblock', 'info', 'whoami', 'rights'}
+        LOCKED_ALLOWED_COMMANDS = {'h', 'q', 'rs', 'block', 'unblock', 'info', 'whoami', 'rights', 'lock', '!tfilter', '!tgmmode'}
         if self.bot_locked and command_word not in LOCKED_ALLOWED_COMMANDS:
              log_lock = f"Command '{command_word}' from {sender_nick} blocked because bot is locked."
              logging.info(log_lock)
@@ -1918,14 +1972,8 @@ class MyTeamTalkBot(TeamTalk):
                 return
 
             try:
-                safety_settings = [ # Define safety settings
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                ]
                 self._send_channel_message(msg_channel_id, f"[Bot] Asking Gemini for {sender_nick}...") # Feedback
-                response = self.gemini_model.generate_content(prompt, stream=False, safety_settings=safety_settings)
+                response = self.gemini_model.generate_content(prompt, stream=False, safety_settings=GEMINI_SAFETY_SETTINGS)
                 gemini_reply = ""
 
                 # Extract response text safely
@@ -2006,15 +2054,17 @@ Bot Control:
  lock               - Toggle locking the bot (restricts most commands).
  block <cmd>        - Block or unblock a specific command for all users.
                       Example: block ct (Toggles block for 'ct' command)
-                      Cannot block essential commands (h, q, rs, lock, block, info).
+                      Cannot block essential commands (h, q, rs, lock, block, info, !tfilter, !tgmmode).
  jc <path>[|<pass>] - Make the bot join a different channel.
  jcl                - Toggle user join/leave announcements ON/OFF.
  tg_chanmsg         - Toggle allowing bot to send channel messages ON/OFF.
  tg_broadcast       - Toggle allowing bot to send broadcasts ON/OFF.
  tg_gemini_pm       - Toggle allowing Gemini AI responses in PM ON/OFF.
  tg_gemini_chan     - Toggle allowing Gemini AI responses via /c ON/OFF.
- gapi <api_key>     - Set the Gemini API key and save it to config.
+ !tgmmode           - Toggle welcome message mode (Template vs Gemini).
+ !tfilter           - Toggle the channel word filter ON/OFF globally.
  !filter <add|remove|list> [word] - Manage the channel word filter list.
+ gapi <api_key>     - Set the Gemini API key and save it to config.
  rs                 - Restart the bot completely.
  q                  - Disconnect and shut down the bot.
 
@@ -2089,7 +2139,12 @@ User Management (Requires bot permissions):
                  weather_status = "ON" if self._weather_enabled else "OFF"
                  lock_status = "ON" if self.bot_locked else "OFF"
                  blocked_cmds_str = ', '.join(sorted(list(self.blocked_commands))) if self.blocked_commands else 'None'
-                 filter_status = f"ON ({len(self.filtered_words)} words)" if self.filtered_words else "OFF"
+                 # Filter Status (Toggle + Word Count)
+                 filter_status_toggle = "ON" if self.filter_enabled else "OFF"
+                 filter_words_count = f"({len(self.filtered_words)} words)" if self.filtered_words else "(No words)"
+                 filter_status = f"{filter_status_toggle} {filter_words_count}"
+                 # Welcome Message Mode
+                 welcome_mode_status = self.welcome_message_mode.capitalize()
 
 
                  info_lines = [
@@ -2106,6 +2161,7 @@ User Management (Requires bot permissions):
                      f"Channel Msgs: {chan_msg_status}",
                      f"Broadcasts: {broadcast_status}",
                      f"Join/Leave Announce: {announce_status}",
+                     f"Welcome Msg Mode: {welcome_mode_status}", # Added Welcome Mode
                      f"Gemini AI: {gemini_status}",
                      f"Weather: {weather_status}",
                      f"Word Filter: {filter_status}",
@@ -2262,14 +2318,8 @@ User Management (Requires bot permissions):
                      return
 
                  try:
-                     safety_settings = [ # Define safety settings
-                         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                     ]
                      self._send_pm(msg_from_id, "[Bot] Asking Gemini...") # Give feedback
-                     response = self.gemini_model.generate_content(prompt, stream=False, safety_settings=safety_settings)
+                     response = self.gemini_model.generate_content(prompt, stream=False, safety_settings=GEMINI_SAFETY_SETTINGS)
                      gemini_reply = ""
 
                      # Extract response text safely
@@ -2313,8 +2363,8 @@ User Management (Requires bot permissions):
             # --- Admin Only Commands ---
             # Define admin commands set for easier checking
             ADMIN_COMMANDS = {
-                "!filter", "lock", "block", "unblock", "jc", "jcl",
-                "tg_chanmsg", "tg_broadcast", "tg_gemini_pm", "tg_gemini_chan", # Specific toggles
+                "!filter", "!tfilter", "lock", "block", "unblock", "jc", "jcl",
+                "tg_chanmsg", "tg_broadcast", "tg_gemini_pm", "tg_gemini_chan", "!tgmmode", # Specific toggles
                 "gapi", "rs", "listusers", "listchannels", "move", "kick", "ban", "unban", "q"
             }
 
@@ -2333,6 +2383,33 @@ User Management (Requires bot permissions):
                         logging.info(f"Processing '!filter' command from admin {sender_nick}")
                         self._handle_filter_command(args_str, msg_from_id)
 
+                    elif command_word == "!tfilter": # TOGGLE FILTER
+                        logging.info(f"Processing '!tfilter' command from admin {sender_nick}")
+                        self.toggle_filter() # Use internal toggle
+                        new_state = "ON" if self.filter_enabled else "OFF"
+                        feedback = f"Word filter is now {new_state}."
+                        self._log_to_gui(f"[Admin] {feedback}")
+                        self._send_pm(msg_from_id, feedback)
+                        if self.main_window: wx.CallAfter(self.main_window.update_feature_list) # Update GUI
+
+                    elif command_word == "!tgmmode": # TOGGLE WELCOME MESSAGE MODE
+                         logging.info(f"Processing '!tgmmode' command from admin {sender_nick}")
+                         if self.welcome_message_mode == "template":
+                             # Before switching to Gemini, check if it's usable
+                             if not self._gemini_enabled:
+                                 self._send_pm(msg_from_id, "Error: Cannot switch to Gemini mode. Gemini AI is not available/configured.")
+                             else:
+                                 self.welcome_message_mode = "gemini"
+                                 feedback = "Welcome message mode set to: Gemini (using AI)."
+                                 self._log_to_gui(f"[Admin] {feedback}")
+                                 self._send_pm(msg_from_id, feedback)
+                         else: # Currently Gemini, switch to Template
+                             self.welcome_message_mode = "template"
+                             feedback = "Welcome message mode set to: Template (using built-in messages)."
+                             self._log_to_gui(f"[Admin] {feedback}")
+                             self._send_pm(msg_from_id, feedback)
+                         # Note: No GUI list update for this mode currently
+
                     elif command_word == "lock":
                          logging.info(f"Processing 'lock' command from admin {sender_nick}")
                          self.toggle_bot_lock() # Use internal toggle
@@ -2340,7 +2417,7 @@ User Management (Requires bot permissions):
                          feedback = f"Bot lock is now {new_state}."
                          self._log_to_gui(f"[Admin] {feedback}")
                          self._send_pm(msg_from_id, feedback)
-                         wx.CallAfter(self.main_window.update_feature_list) # Update GUI
+                         if self.main_window: wx.CallAfter(self.main_window.update_feature_list) # Update GUI
 
                     elif command_word in ["block", "unblock"]: # COMMAND BLOCKING
                          logging.info(f"Processing '{command_word}' command from admin {sender_nick}")
@@ -2404,29 +2481,29 @@ User Management (Requires bot permissions):
                          feedback = f"Channel join/leave announcements are now {new_state}."
                          self._log_to_gui(f"[Admin] {feedback}")
                          self._send_pm(msg_from_id, feedback)
-                         wx.CallAfter(self.main_window.update_feature_list) # Update GUI
+                         if self.main_window: wx.CallAfter(self.main_window.update_feature_list) # Update GUI
 
                     # --- Specific Feature Toggles ---
                     elif command_word == "tg_chanmsg":
                          self.toggle_allow_channel_messages()
                          state = "ON" if self.allow_channel_messages else "OFF"
                          self._send_pm(msg_from_id, f"Allow Channel Messages toggled {state}.")
-                         wx.CallAfter(self.main_window.update_feature_list)
+                         if self.main_window: wx.CallAfter(self.main_window.update_feature_list)
                     elif command_word == "tg_broadcast":
                         self.toggle_allow_broadcast()
                         state = "ON" if self.allow_broadcast else "OFF"
                         self._send_pm(msg_from_id, f"Allow Broadcast Messages toggled {state}.")
-                        wx.CallAfter(self.main_window.update_feature_list)
+                        if self.main_window: wx.CallAfter(self.main_window.update_feature_list)
                     elif command_word == "tg_gemini_pm":
                         self.toggle_allow_gemini_pm()
                         state = "ON" if self.allow_gemini_pm else "OFF"
                         self._send_pm(msg_from_id, f"Allow Gemini (PM) toggled {state}.")
-                        wx.CallAfter(self.main_window.update_feature_list)
+                        if self.main_window: wx.CallAfter(self.main_window.update_feature_list)
                     elif command_word == "tg_gemini_chan":
                         self.toggle_allow_gemini_channel()
                         state = "ON" if self.allow_gemini_channel else "OFF"
                         self._send_pm(msg_from_id, f"Allow Gemini (Channel /c) toggled {state}.")
-                        wx.CallAfter(self.main_window.update_feature_list)
+                        if self.main_window: wx.CallAfter(self.main_window.update_feature_list)
                     # --- End Specific Feature Toggles ---
 
 
@@ -2447,7 +2524,7 @@ User Management (Requires bot permissions):
                               feedback = "Gemini API key updated, but failed to initialize Gemini model. Check the key and logs. Features remain disabled."
                               self._save_runtime_config(save_gemini_key=True) # Save key even if init fails
                          self._send_pm(msg_from_id, feedback)
-                         wx.CallAfter(self.main_window.update_feature_list) # Update GUI
+                         if self.main_window: wx.CallAfter(self.main_window.update_feature_list) # Update GUI
 
 
                     elif command_word == "rs": # RESTART COMMAND
@@ -2478,8 +2555,9 @@ User Management (Requires bot permissions):
                               user_list.append(" (No users found)")
                          else:
                              # Sort users by nickname (case-insensitive)
-                             users.sort(key=lambda u: ttstr(u.szNickname).lower() if u and u.szNickname else "")
-                             for user in users:
+                             users_list = list(users) # Convert generator/sequence to list for sorting
+                             users_list.sort(key=lambda u: ttstr(u.szNickname).lower() if u and u.szNickname else "")
+                             for user in users_list:
                                   if user and user.nUserID > 0:
                                       nick = ttstr(user.szNickname) if user.szNickname else f"ID_{user.nUserID}"
                                       user_list.append(f"- {nick} (ID: {user.nUserID}, User: {ttstr(user.szUsername)})")
@@ -2494,7 +2572,9 @@ User Management (Requires bot permissions):
                               channel_list.append("(No channels found or error retrieving list)")
                          else:
                              channel_data = []
-                             for chan in channels:
+                             # Channels might be a sequence, convert to list first
+                             channels_list = list(channels)
+                             for chan in channels_list:
                                  if not chan or chan.nChannelID <= 0: continue
                                  try: path = ttstr(self.getChannelPath(chan.nChannelID))
                                  except Exception: path = f"(Error getting path for ID {chan.nChannelID})"
@@ -2538,7 +2618,8 @@ User Management (Requires bot permissions):
                         # Find user specifically in the bot's current channel
                         channel_users = self.getChannelUsers(self._target_channel_id)
                         if channel_users:
-                            for user in channel_users:
+                            channel_users_list = list(channel_users) # Convert to list
+                            for user in channel_users_list:
                                 if user and user.nUserID > 0 and ttstr(user.szNickname).lower() == target_nick_kick.lower():
                                     target_user_kick_id = user.nUserID
                                     break
@@ -2774,7 +2855,9 @@ User Management (Requires bot permissions):
     # --- Feature Toggle Methods (Called by GUI/Commands) ---
     def toggle_announce_join_leave(self):
         self.announce_join_leave = not self.announce_join_leave
-        self._log_to_gui(f"Join/Leave Announce toggled {'ON' if self.announce_join_leave else 'OFF'}")
+        feedback = f"Join/Leave Announce toggled {'ON' if self.announce_join_leave else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
         # No config save needed for toggles unless desired
 
     def toggle_allow_channel_messages(self):
@@ -2785,7 +2868,9 @@ User Management (Requires bot permissions):
              logging.warning(msg)
              return # Prevent enabling without rights
         self.allow_channel_messages = not self.allow_channel_messages
-        self._log_to_gui(f"Allow Channel Messages toggled {'ON' if self.allow_channel_messages else 'OFF'}")
+        feedback = f"Allow Channel Messages toggled {'ON' if self.allow_channel_messages else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
 
     def toggle_allow_broadcast(self):
         # Check rights before enabling
@@ -2795,7 +2880,9 @@ User Management (Requires bot permissions):
              logging.warning(msg)
              return
         self.allow_broadcast = not self.allow_broadcast
-        self._log_to_gui(f"Allow Broadcasts toggled {'ON' if self.allow_broadcast else 'OFF'}")
+        feedback = f"Allow Broadcasts toggled {'ON' if self.allow_broadcast else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
 
     def toggle_allow_gemini_pm(self):
         # Check if Gemini itself is ready before enabling
@@ -2805,7 +2892,9 @@ User Management (Requires bot permissions):
              logging.warning(msg)
              return
         self.allow_gemini_pm = not self.allow_gemini_pm
-        self._log_to_gui(f"Allow Gemini AI (PM) toggled {'ON' if self.allow_gemini_pm else 'OFF'}")
+        feedback = f"Allow Gemini AI (PM) toggled {'ON' if self.allow_gemini_pm else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
 
     def toggle_allow_gemini_channel(self):
         # Check if Gemini itself is ready before enabling
@@ -2815,13 +2904,48 @@ User Management (Requires bot permissions):
              logging.warning(msg)
              return
         self.allow_gemini_channel = not self.allow_gemini_channel
-        self._log_to_gui(f"Allow Gemini AI (Channel /c) toggled {'ON' if self.allow_gemini_channel else 'OFF'}")
+        feedback = f"Allow Gemini AI (Channel /c) toggled {'ON' if self.allow_gemini_channel else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
 
     def toggle_bot_lock(self):
         """Toggles the bot lock state."""
         self.bot_locked = not self.bot_locked
-        self._log_to_gui(f"Bot Lock toggled {'ON' if self.bot_locked else 'OFF'}")
+        feedback = f"Bot Lock toggled {'ON' if self.bot_locked else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
 
+    def toggle_filter(self):
+        """Toggles the word filter state."""
+        # Prevent enabling if there are no words defined
+        if not self.filter_enabled and not self.filtered_words:
+            msg = "Cannot enable filter: No words are defined in the filter list (!filter add <word>)."
+            self._log_to_gui(f"[Warning] {msg}")
+            logging.warning(msg)
+            return
+        self.filter_enabled = not self.filter_enabled
+        feedback = f"Word Filter toggled {'ON' if self.filter_enabled else 'OFF'}"
+        logging.info(feedback)
+        self._log_to_gui(f"[Toggle] {feedback}")
+
+    # --- Add more event handler stubs as needed ---
+    # def onCmdFileNew(self, remotefile: RemoteFile): pass
+    # def onCmdFileRemove(self, remotefile: RemoteFile): pass
+    # def onUserRecordMediaFile(self, userid: int, mediafileinfo: MediaFileInfo): pass
+    # def onUserAccountNew(self, useraccount: UserAccount): pass
+    # def onUserAccountRemove(self, useraccount: UserAccount): pass
+    # def onUserAudioBlock(self, nUserID: int, nStreamType: StreamType): pass
+    # def onStreamMediaFile(self, mediafileinfo: MediaFileInfo): pass
+    # def onUserAccount(self, useraccount: UserAccount): pass
+    # def onBannedUser(self, banneduser: BannedUser): pass
+    # def onServerStatistics(self, serverstatistics: ServerStatistics): pass
+    # def onSoundDeviceAdded(self, sounddevice: SoundDevice): pass
+    # def onSoundDeviceRemoved(self, sounddevice: SoundDevice): pass
+    # def onSoundDeviceUnplugged(self, sounddevice: SoundDevice): pass
+    # def onSoundDeviceNewDefaultInput(self, sounddevice: SoundDevice): pass
+    # def onSoundDeviceNewDefaultOutput(self, sounddevice: SoundDevice): pass
+    # def onSoundDeviceNewDefaultInputComDevice(self, sounddevice: SoundDevice): pass
+    # def onSoundDeviceNewDefaultOutputComDevice(self, sounddevice: SoundDevice): pass
 
 
 # --- Global Variables ---

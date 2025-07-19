@@ -7,13 +7,19 @@ from ctypes import cdll, c_int, c_char, c_wchar, c_wchar_p, c_char_p, \
 
 if sys.platform == "win32":
     if (sys.version_info.major == 3 and sys.version_info.minor >= 8):
-        os.add_dll_directory(os.getcwd())
         # Path relative to TeamTalk SDK's DLL location
-        os.add_dll_directory(os.path.dirname(os.path.abspath(__file__)) + "\\TeamTalk_DLL")
+        os.add_dll_directory(os.path.join(os.path.dirname(os.path.abspath(__file__)), "TeamTalk_DLL"))
     dll = cdll.TeamTalk5
     TTCHAR = c_wchar
     TTCHAR_P = c_wchar_p
     from ctypes.wintypes import BOOL
+    LOADED_TT_LIB = "TeamTalk5.dll"
+elif sys.platform.startswith("linux"):
+    dll = cdll.LoadLibrary(os.path.join(os.path.dirname(os.path.abspath(__file__)), "TeamTalk_DLL", "libTeamTalk5.so"))
+    TTCHAR = c_char
+    TTCHAR_P = c_char_p
+    BOOL = c_int
+    LOADED_TT_LIB = "libTeamTalk5.so"
 elif sys.platform == "darwin":
     # Darwin is not supported. Seems SIP is preventing this from
     # working. Setting DYLD_LIBRARY_PATH doesn't help.
@@ -22,6 +28,7 @@ elif sys.platform == "darwin":
     TTCHAR_P = c_char_p
     BOOL = c_int
 else:
+    # Fallback for other Unix-like systems
     dll = cdll.LoadLibrary("libTeamTalk5.so")
     TTCHAR = c_char
     TTCHAR_P = c_char_p

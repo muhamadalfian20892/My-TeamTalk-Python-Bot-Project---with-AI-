@@ -1,3 +1,6 @@
-wxpython
-configparser
-google.generativeai
+wxPython
+google-generativeai
+requests
+pytz
+apscheduler
+sqlalchemy
